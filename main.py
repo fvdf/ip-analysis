@@ -4,22 +4,14 @@ import json
 import urllib.parse
 from typing import Any
 
-from ip_analysis import (
-    MAX_CSV_BYTES,
-    MAX_UNIQUE_IPS,
-    PayloadTooLargeError,
-    TooManyIpsError,
-    UpstreamRateLimitError,
-    build_api_response_for_multiple_ips,
-    build_api_response_for_single_ip,
-)
-
-
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type",
 }
+
+MAX_CSV_BYTES = 1_000_000
+MAX_UNIQUE_IPS = 100
 
 
 def get_request_attr(req: Any, *names: str, default: Any = None) -> Any:
@@ -113,6 +105,8 @@ def handle_health() -> tuple[int, dict]:
 
 
 def handle_analyze_ip(payload: dict) -> tuple[int, dict]:
+    from ip_analysis import build_api_response_for_single_ip
+
     ip = str(payload.get("ip", "")).strip()
     if not ip:
         return 400, {"ok": False, "error": "Field 'ip' is required."}
@@ -120,6 +114,8 @@ def handle_analyze_ip(payload: dict) -> tuple[int, dict]:
 
 
 def handle_analyze_ips(payload: dict) -> tuple[int, dict]:
+    from ip_analysis import build_api_response_for_multiple_ips
+
     ips = payload.get("ips", [])
     if ips is None:
         ips = []
@@ -132,6 +128,15 @@ def handle_analyze_ips(payload: dict) -> tuple[int, dict]:
 
     response = build_api_response_for_multiple_ips(ips, csv_text=csv_text)
     return (200 if response.get("ok") else 400), response
+
+
+def status_for_exception(error: Exception) -> int:
+    name = error.__class__.__name__
+    if name in {"PayloadTooLargeError", "TooManyIpsError"}:
+        return 413
+    if name == "UpstreamRateLimitError":
+        return 429
+    return 500
 
 
 def main(context: Any) -> Any:
@@ -168,15 +173,14 @@ def main(context: Any) -> Any:
             return json_response(context, response_payload, status)
 
         return json_response(context, {"ok": False, "error": "Route not found."}, 404)
-    except PayloadTooLargeError as error:
-        return json_response(context, {"ok": False, "error": str(error)}, 413)
-    except TooManyIpsError as error:
-        return json_response(context, {"ok": False, "error": str(error)}, 413)
-    except UpstreamRateLimitError as error:
-        payload = {"ok": False, "error": str(error)}
-        if error.ttl is not None:
-            payload["retry_after_seconds"] = error.ttl
-        return json_response(context, payload, 429)
     except Exception as error:
+        status_code = status_for_exception(error)
+        if status_code != 500:
+            payload = {"ok": False, "error": str(error)}
+            ttl = getattr(error, "ttl", None)
+            if ttl is not None:
+                payload["retry_after_seconds"] = ttl
+            return json_response(context, payload, status_code)
+
         context.error(str(error))
         return json_response(context, {"ok": False, "error": "Internal server error."}, 500)
